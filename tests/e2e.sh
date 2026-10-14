@@ -10,9 +10,9 @@
 set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 
-FAILS=0
-pass() { printf '  \033[1;32mPASS\033[0m  %s\n' "$*"; }
-fail() { printf '  \033[1;31mFAIL\033[0m  %s\n' "$*"; FAILS=$((FAILS + 1)); }
+FAILS=0; PASSES=0
+pass() { printf '  \033[1;32mPASS\033[0m  %s\n' "$*"; PASSES=$((PASSES + 1)); }
+fail() { printf '  \033[1;31mFAIL\033[0m  %s\n' "$*"; FAILS=$((FAILS + 1)); [[ -n "${GITHUB_ACTIONS:-}" ]] && echo "::error title=e2e::$*"; return 0; }
 check() { local msg="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$msg"; else fail "$msg"; fi; }
 group() { echo "::group::$*"; }
 endgroup() { echo "::endgroup::"; }
@@ -36,6 +36,10 @@ check "no servicelb daemonsets" bash -c "! k3s kubectl get ds -A -o name | grep 
 check "no helm-install jobs" bash -c "! k3s kubectl get jobs -A -o name | grep -q helm-install"
 check "secrets encryption enabled" bash -c "k3s secrets-encrypt status | grep -q 'Encryption Status: Enabled'"
 check "kubectl top works (metrics-server)" bash -c "for i in \$(seq 1 30); do k3s kubectl top node >/dev/null 2>&1 && exit 0; sleep 5; done; exit 1"
+
+K3S_VERSION="$(k3s --version | head -n1 | awk '{print $3}')"
+SYS_PODS="$(k -n kube-system get pods --no-headers | awk '{print $1}' | sed -E 's/-[a-z0-9]+(-[a-z0-9]+)?$//' | sort -u | xargs)"
+echo "k3s $K3S_VERSION, kube-system: $SYS_PODS"
 
 # ---------------------------------------------------------------- 2. fixtures
 group "fixtures"
@@ -149,5 +153,8 @@ endgroup
 check "k3s removed" test ! -e /usr/local/bin/k3s
 
 echo
-if [[ $FAILS -gt 0 ]]; then echo "$FAILS check(s) failed"; exit 1; fi
+if [[ $FAILS -gt 0 ]]; then echo "$FAILS check(s) failed, $PASSES passed"; exit 1; fi
 echo "All end-to-end checks passed"
+if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+  echo "::notice title=k3s + cleanup end-to-end::$PASSES checks passed on k3s $K3S_VERSION. kube-system ran only: $SYS_PODS. Cleanup dry run, --apply and repeat run verified against real workloads."
+fi
