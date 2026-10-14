@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# Cemal.cloud k8s-debloat | end-to-end test on a disposable CI VM (root)
+#
+#   1. k3s-minimal-install.sh installs a real k3s node with the minimal config
+#   2. k8s-cleanup.sh finds exactly the right objects in dry-run, deletes them
+#      with --apply, and finds nothing on the next run
+#   3. k3s uninstalls cleanly
+#
+# Do not run this on a machine you care about.
+set -Eeuo pipefail
+cd "$(dirname "$0")/.."
+
+FAILS=0
+pass() { printf '  \033[1;32mPASS\033[0m  %s\n' "$*"; }
+fail() { printf '  \033[1;31mFAIL\033[0m  %s\n' "$*"; FAILS=$((FAILS + 1)); }
+check() { local msg="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$msg"; else fail "$msg"; fi; }
+group() { echo "::group::$*"; }
+endgroup() { echo "::endgroup::"; }
+
+[[ $EUID -eq 0 ]] || { echo "run as root"; exit 1; }
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+k() { k3s kubectl "$@"; }
+IMG=registry.k8s.io/e2e-test-images/busybox:1.36.1-1
+
+# ---------------------------------------------------------------- 1. install
+group "k3s-minimal-install.sh"
+./k3s-minimal-install.sh --tls-san 127.0.0.1
+endgroup
+check "config.yaml is 0600" test "$(stat -c %a /etc/rancher/k3s/config.yaml)" = 600
+check "kubeconfig is 0600" test "$(stat -c %a /etc/rancher/k3s/k3s.yaml)" = 600
+check "node is Ready" bash -c "k3s kubectl get nodes --no-headers | grep -q ' Ready'"
+check "coredns, metrics-server, local-path available" \
+  k3s kubectl -n kube-system wait --for=condition=Available deploy/coredns deploy/metrics-server deploy/local-path-provisioner --timeout=300s
+check "traefik not installed" bash -c "! k3s kubectl -n kube-system get deploy traefik"
+check "no servicelb daemonsets" bash -c "! k3s kubectl get ds -A -o name | grep -q svclb"
+check "no helm-install jobs" bash -c "! k3s kubectl get jobs -A -o name | grep -q helm-install"
+check "secrets encryption enabled" bash -c "k3s secrets-encrypt status | grep -q 'Encryption Status: Enabled'"
+check "kubectl top works (metrics-server)" bash -c "for i in \$(seq 1 30); do k3s kubectl top node >/dev/null 2>&1 && exit 0; sleep 5; done; exit 1"
+
+# ---------------------------------------------------------------- 2. fixtures
+group "fixtures"
+k create ns e2e
+k create ns empty-ns
+k -n e2e create configmap app-cfg --from-literal=a=1
+k -n e2e create configmap old-cfg --from-literal=a=1
+k -n e2e create secret generic app-sec --from-literal=p=1
+k -n e2e create secret generic old-sec --from-literal=p=1
+cat <<EOF | k apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: app, namespace: e2e}
+spec:
+  containers:
+  - name: c
+    image: registry.k8s.io/pause:3.9
+    envFrom: [{configMapRef: {name: app-cfg}}]
+    env: [{name: P, valueFrom: {secretKeyRef: {name: app-sec, key: p}}}]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: orphan, namespace: e2e}
+spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 1Gi}}, storageClassName: manual}
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata: {name: e2e-pv-released}
+spec:
+  capacity: {storage: 1Gi}
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: manual
+  hostPath: {path: /tmp/e2e-pv}
+  claimRef: {namespace: e2e, name: gone, uid: 11111111-2222-3333-4444-555555555555}
+EOF
+k -n e2e run completed --image=$IMG --restart=Never --command -- true
+k -n e2e run failed --image=$IMG --restart=Never --command -- false
+k -n e2e create job job-old --image=$IMG -- true
+k -n e2e create cronjob nightly --image=$IMG --schedule="0 3 * * *" -- true
+k -n e2e create job cron-old --from=cronjob/nightly
+k -n e2e create deployment web --image=registry.k8s.io/pause:3.9 --replicas=0
+for t in 3.8 3.7 3.6; do
+  k -n e2e set image deployment/web pause=registry.k8s.io/pause:$t
+  k -n e2e rollout status deployment/web --timeout=60s
+done
+for v in 1 2 3 4; do
+  k -n e2e create secret generic sh.helm.release.v1.myrel.v$v --type=helm.sh/release.v1 --from-literal=release=x
+  k -n e2e label secret sh.helm.release.v1.myrel.v$v owner=helm name=myrel version=$v status=superseded
+done
+k -n e2e wait --for=jsonpath='{.status.phase}'=Succeeded pod/completed --timeout=300s
+k -n e2e wait --for=jsonpath='{.status.phase}'=Failed pod/failed --timeout=300s
+k -n e2e wait --for=condition=complete job/job-old job/cron-old --timeout=300s
+k -n e2e wait --for=condition=Ready pod/app --timeout=300s
+for _ in $(seq 1 30); do
+  [[ "$(k get pv e2e-pv-released -o jsonpath='{.status.phase}')" == Released ]] && break; sleep 2
+done
+echo "waiting 75 s so job-old is older than --older-than 60s"; sleep 75
+k -n e2e create job job-new --image=$IMG -- true
+k -n e2e wait --for=condition=complete job/job-new --timeout=300s
+k -n e2e get pods,jobs,rs,pvc; k get pv
+endgroup
+
+# ---------------------------------------------------------------- 3. cleanup dry run
+group "k8s-cleanup.sh (dry run)"
+DRY="$(./k8s-cleanup.sh -n e2e --older-than 60s 2>&1)"; echo "$DRY"
+endgroup
+has()  { grep -qF -- "$1" <<<"$DRY"; }
+hasnt(){ ! grep -qF -- "$1" <<<"$DRY"; }
+check "dry run: Succeeded pod"            has "would delete pod e2e/completed"
+check "dry run: Failed pod"               has "would delete pod e2e/failed"
+check "dry run: running pod kept"         hasnt "pod e2e/app"
+check "dry run: old Job"                  has "would delete job e2e/job-old"
+check "dry run: new Job kept"             hasnt "job e2e/job-new"
+check "dry run: CronJob-owned Job kept"   hasnt "job e2e/cron-old"
+check "dry run: 2 of 4 ReplicaSets"       test "$(grep -c 'would delete replicaset e2e/web-' <<<"$DRY")" = 2
+check "dry run: Released PV reported"     has "e2e-pv-released  Released  Retain"
+check "report: unmounted PVC"             has "e2e/orphan"
+check "report: unused ConfigMap"          has "configmap e2e/old-cfg"
+check "report: used ConfigMap not listed" hasnt "configmap e2e/app-cfg"
+check "report: unused Secret"             has "e2e/old-sec"
+check "report: used Secret not listed"    hasnt "e2e/app-sec"
+check "report: Helm history"              has "e2e/myrel: 4 revisions stored"
+ALL="$(./k8s-cleanup.sh 2>&1)"
+check "report: empty namespace (all-namespace run)" grep -qF "namespace empty-ns" <<<"$ALL"
+check "dry run deleted nothing" k -n e2e get pod completed
+
+# ---------------------------------------------------------------- 4. apply
+group "k8s-cleanup.sh --apply"
+./k8s-cleanup.sh -n e2e --older-than 60s --delete-released-pv --skip-reports --apply
+endgroup
+sleep 5
+check "Succeeded pod deleted"     bash -c "! k3s kubectl -n e2e get pod completed"
+check "Failed pod deleted"        bash -c "! k3s kubectl -n e2e get pod failed"
+check "running pod kept"          k -n e2e get pod app
+check "old Job deleted"           bash -c "! k3s kubectl -n e2e get job job-old"
+check "new Job kept"              k -n e2e get job job-new
+check "CronJob-owned Job kept"    k -n e2e get job cron-old
+check "2 ReplicaSets left"        test "$(k -n e2e get rs --no-headers | grep -c '^web-')" = 2
+check "Released PV deleted"       bash -c "! k3s kubectl get pv e2e-pv-released"
+check "unused ConfigMap NOT deleted (report only)" k -n e2e get configmap old-cfg
+
+AGAIN="$(./k8s-cleanup.sh -n e2e --older-than 1h --skip-reports 2>&1)"
+check "second run finds nothing" grep -q "pods 0  |  jobs 0  |  replicasets 0  |  pv 0" <<<"$AGAIN"
+check "--prune-images on the node" ./k8s-cleanup.sh -n e2e --skip-reports --prune-images --apply
+
+# ---------------------------------------------------------------- 5. uninstall
+group "uninstall"
+/usr/local/bin/k3s-uninstall.sh
+endgroup
+check "k3s removed" test ! -e /usr/local/bin/k3s
+
+echo
+if [[ $FAILS -gt 0 ]]; then echo "$FAILS check(s) failed"; exit 1; fi
+echo "All end-to-end checks passed"
