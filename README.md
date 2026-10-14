@@ -1,142 +1,82 @@
-<div align="center">
+# Kubernetes Debloat · Cemal.cloud
 
-```
-  ____                     _       _                 _
- / ___|___ _ __ ___   __ _| |  ___| | ___  _   _  __| |
-| |   / _ \ '_ ` _ \ / _` | | / __| |/ _ \| | | |/ _` |
-| |__|  __/ | | | | | (_| | || (__| | (_) | |_| | (_| |
- \____\___|_| |_| |_|\__,_|_(_)___|_|\___/ \__,_|\__,_|
-```
-
-# Kubernetes Debloat
-
-**Traefik ve ServiceLB olmadan sade k3s kurulumu ve her cluster için varsayılanı dry-run olan temizlik scripti.**
+İki küçük araç: gereksiz bileşenler olmadan sade bir k3s cluster kurar, çalışan bir cluster'da biriken çöpü bulup temizler.
 
 [![ci](https://github.com/cemal-demirci/k8s-debloat/actions/workflows/ci.yml/badge.svg)](https://github.com/cemal-demirci/k8s-debloat/actions/workflows/ci.yml)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
-[cemal.cloud](https://cemal.cloud)
+## Neden?
 
-</div>
+**k3s** varsayılan olarak Traefik, kendi load balancer'ı (ServiceLB) ve Helm controller ile gelir. Çoğu kurulumda bunların yerine ingress-nginx veya MetalLB gibi kendi seçtiğiniz araçlar kullanılır. Varsayılanlar ise boşuna kaynak harcar ve çakışma yaratır.
 
----
+Zamanla her cluster'da **çöp birikir**: bitmiş pod'lar, eski job'lar, her deploy'dan geriye kalan ReplicaSet'ler, sahipsiz diskler, kullanılmayan image'lar. Bunlar etcd'yi şişirir, `kubectl get` çıktısını kalabalıklaştırır ve node'ların diskini doldurur.
 
-İki araç:
-
-- **`k3s-minimal-install.sh`**: sadece iş yükünüzü çalıştırmak için gerekenlerle sade bir k3s node'u kurar.
-- **`k8s-cleanup.sh`**: herhangi bir cluster'da (k3s, kubeadm, EKS, AKS, GKE) birikmiş çöpü bulur. Varsayılanı dry-run'dır.
-
-## İndirme
+## Hızlı başlangıç
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/cemal-demirci/k8s-debloat/main/k3s-minimal-install.sh
 curl -fsSLO https://raw.githubusercontent.com/cemal-demirci/k8s-debloat/main/k8s-cleanup.sh
 chmod +x k3s-minimal-install.sh k8s-cleanup.sh
-```
 
----
+sudo ./k3s-minimal-install.sh     # sade bir k3s node kur
+./k8s-cleanup.sh                  # cluster'daki çöpü göster (hiçbir şey silmez)
+./k8s-cleanup.sh --apply          # temizle
+```
 
 ## k3s-minimal-install.sh
 
+Resmi k3s kurucusunu sade bir ayar dosyasıyla (`/etc/rancher/k3s/config.yaml`) çalıştırır.
+
+| Kapatılan | Neden | Geri açmak için |
+|---|---|---|
+| Traefik | Kendi ingress'inizi kullanın (ingress-nginx, Gateway API) | `--keep-traefik` |
+| ServiceLB | MetalLB, bulut load balancer'ı veya hostNetwork kullanın | `--keep-servicelb` |
+| Helm controller | Sadece HelmChart kaynakları için gerekli | `--keep-helm-controller` |
+| Cloud controller | Fiziksel sunucu ve sanal makinede gereksiz | |
+
+**Kalanlar:** CoreDNS, flannel (pod ağı), NetworkPolicy desteği, metrics-server (`kubectl top` ve otomatik ölçekleme için), local-path (tek node'da disk). İsterseniz `--no-metrics` ve `--no-local-storage` ile bunlar da kapatılır.
+
+**Eklenenler:** secret'lar diskte şifreli saklanır, kubeconfig'i sadece root okuyabilir, container logları döndürülür (10 MB x 3), disk dolmaya başlayınca kullanılmayan image'lar silinir, HA kurulumda 6 saatte bir etcd yedeği alınır.
+
 ```bash
-sudo ./k3s-minimal-install.sh                                    # tek server
-sudo ./k3s-minimal-install.sh --cluster-init --tls-san 10.0.0.10 # HA: ilk server (embedded etcd)
-sudo ./k3s-minimal-install.sh --server https://10.0.0.10:6443 --token <TOKEN>          # HA: ek server
-sudo ./k3s-minimal-install.sh --agent --server https://10.0.0.10:6443 --token <TOKEN>  # worker
-./k3s-minimal-install.sh --dry-run                               # sadece config'i göster
+sudo ./k3s-minimal-install.sh                                                          # tek node
+sudo ./k3s-minimal-install.sh --cluster-init --tls-san 10.0.0.10                        # HA: ilk server
+sudo ./k3s-minimal-install.sh --server https://10.0.0.10:6443 --token <TOKEN>           # HA: ek server
+sudo ./k3s-minimal-install.sh --agent --server https://10.0.0.10:6443 --token <TOKEN>   # worker
+./k3s-minimal-install.sh --dry-run                                                      # sadece ayarı göster
 ```
 
-`/etc/rancher/k3s/config.yaml` yazar (varsa önce yedekler) ve resmi `get.k3s.io` kurucusunu çalıştırır. Kurucu bu dosyayı kendisi okur.
-
-### Ne kapatılır, ne kalır
-
-| Kapalı (varsayılan) | Neden | Geri açmak |
-|---|---|---|
-| traefik | Kendi ingress'inizi getirin (ingress-nginx, Gateway API) | `--keep-traefik` |
-| servicelb (klipper-lb) | MetalLB, bulut LB veya hostNetwork kullanın | `--keep-servicelb` |
-| helm-controller | Sadece HelmChart CRD'leri için gerekli | `--keep-helm-controller` |
-| cloud-controller | Fiziksel sunucu ve VM'de gereksiz | (yok) |
-
-| Açık (varsayılan) | Neden | Kapatmak |
-|---|---|---|
-| coredns, flannel | Cluster DNS ve pod ağı | `--flannel none` (kendi CNI'niz için) |
-| network-policy | NetworkPolicy desteği (güvenlik) | (yok) |
-| metrics-server | `kubectl top` ve HPA | `--no-metrics` |
-| local-storage | Tek node'da local-path PV | `--no-local-storage` |
-
-**Eklenen sağlamlaştırma:** secrets'lar etcd'de şifreli (`secrets-encryption`), kubeconfig `0600`, container log rotasyonu (10 MiB x 3), image GC eşikleri (%80 / %60), HA modunda 6 saatte bir etcd snapshot (12 adet saklanır).
-
-| Diğer parametreler | |
-|---|---|
-| `--version v1.37.1+k3s1` | Sürüm sabitle (varsayılan: stable kanal) |
-| `--node-ip IP` | Çok NIC'li sunucuda duyurulacak IP |
-| `--flannel BACKEND` | `vxlan` (varsayılan), `wireguard-native`, `host-gw`, `none` |
-| `--config-only` | Sadece config yazar, kurmaz |
-
-Kaldırmak için: `/usr/local/bin/k3s-uninstall.sh` (agent'ta `k3s-agent-uninstall.sh`).
-
----
+Diğer seçenekler (`--version`, `--node-ip`, `--flannel` ...) için `--help`. Kaldırmak için `/usr/local/bin/k3s-uninstall.sh`.
 
 ## k8s-cleanup.sh
 
+Her Kubernetes cluster'ında çalışır: k3s, kubeadm, EKS, AKS, GKE. Varsayılan olarak **hiçbir şey silmez**, sadece neyin silineceğini gösterir. Silmek için `--apply` eklemeniz gerekir.
+
+| Silinenler (`--apply` ile) | Kural |
+|---|---|
+| Pod | Tamamlanmış, hata vermiş veya tahliye edilmiş (Evicted) |
+| Job | Bitmiş ve `--older-than` süresinden eski (varsayılan 24 saat). CronJob'lara ait job'lar atlanır, onları CronJob kendisi yönetir. |
+| ReplicaSet | Eski deploy'lardan kalanlar. Her Deployment için en yeni 2 tanesi geri dönüş için saklanır (`--keep-rs`). |
+| PersistentVolume | Sahibi silinmiş (Released) diskler, sadece `--delete-released-pv` ile. Diskteki veri silinmez, sadece Kubernetes kaydı silinir. |
+| Image | Node'daki kullanılmayan image'lar, sadece `--prune-images` ile |
+
+Şunlar **asla otomatik silinmez**, sadece listelenir, karar size kalır: hiçbir pod'un kullanmadığı PVC'ler, ConfigMap ve Secret'lar, boş namespace'ler, çok fazla geçmiş saklayan Helm release'leri.
+
 ```bash
-./k8s-cleanup.sh                          # dry-run, tüm namespace'ler
-./k8s-cleanup.sh --apply                  # uygula
-./k8s-cleanup.sh -n media --apply         # tek namespace
-./k8s-cleanup.sh --context prod --older-than 72h
-sudo ./k8s-cleanup.sh --prune-images --apply   # node üzerinde kullanılmayan image'lar
+./k8s-cleanup.sh -n media --apply                  # tek namespace
+./k8s-cleanup.sh --context prod --older-than 72h   # başka cluster, farklı süre
+sudo ./k8s-cleanup.sh --prune-images --apply       # bu node'daki kullanılmayan image'lar
 ```
 
 Gereksinim: `kubectl` (veya `k3s kubectl`) ve `jq`.
 
-### Silinenler (`--apply` ile)
+## Nasıl test ediliyor?
 
-| Kaynak | Kural |
-|---|---|
-| Pod | `Succeeded`, `Failed` veya `Evicted` |
-| Job | Bitmiş ve `--older-than`'dan eski (varsayılan 24h). CronJob'a ait olanlar atlanır, onları CronJob'un history limiti yönetir. |
-| ReplicaSet | 0'a ölçeklenmiş eski revizyonlar. Her Deployment için en yeni `--keep-rs` kadarı (varsayılan 2) rollback için saklanır. |
-| PersistentVolume | `Released` / `Failed` olanlar, sadece `--delete-released-pv` ile. `Retain` politikalı diskteki veri silinmez, sadece PV nesnesi silinir. |
-| Image | Node'daki kullanılmayan image'lar, sadece `--prune-images` ile (`crictl rmi --prune`) |
-
-### Sadece raporlananlar
-
-Bunlar asla otomatik silinmez, karar insana kalır:
-
-- Hiçbir pod'un bağlamadığı PVC'ler
-- Hiçbir pod'un referans vermediği ConfigMap ve Secret'lar (operatörler bunları doğrudan kullanıyor olabilir)
-- İçinde iş yükü olmayan namespace'ler
-- `--keep-rs` sayısından fazla revizyon saklayan Helm release'leri
-
-### Test
-
-Her commit'te GitHub Actions'ta uçtan uca çalıştırılır: `k3s-minimal-install.sh` gerçek bir k3s node'u kurar (Traefik, ServiceLB ve helm-install job'larının gelmediği, secrets şifrelemenin açık olduğu, `kubectl top`'un çalıştığı doğrulanır), ardından gerçek iş yükleriyle temizlik scripti dry-run, `--apply` ve tekrar çalıştırma ile test edilir, en sonda k3s kaldırılır.
-
-Ayrıca k3s v1.37 API'sine karşı elle test edildi: bitmiş ve evicted pod'lar, eski ve yeni Job'lar, CronJob'a ait Job, 4 revizyonlu Deployment, Released PV, bağlanmamış PVC, kullanılmayan ConfigMap / Secret, boş namespace ve 4 revizyonlu Helm release. Dry-run, `--apply` ve tekrar çalıştırma (0 değişiklik) doğrulandı.
-
-## Prensipler
-
-1. **Önce göster.** Dry-run modu ile neyin değişeceğini önce görün.
-2. **Yedek al.** Değişiklikten önce yedek ve geri alma dosyası yazılır.
-3. **Geri alınabilir.** Her değişikliğin geri dönüş yolu var.
-4. **Kritik olana dokunma.** Sistemi ayakta tutan parçalar korunur.
-5. **Sessiz hata yok.** Kontrol yapılamıyorsa script güvenli tarafta kalır ve durur.
-
-## Sorumluluk
-
-Bu scriptler sistem ayarlarını değiştirir ve yazılım kaldırır. Kendi sorumluluğunuzda kullanın, önce test ortamında deneyin. Kurumsal yönetilen cihazlarda BT ekibinizle konuşmadan çalıştırmayın.
-
-## Diğer Cemal.cloud araçları
-
-| Repo | |
-|---|---|
-| [`win11-debloat`](https://github.com/cemal-demirci/win11-debloat) | Copilot, Recall, reklam ve telemetriyi kaldıran, her değişikliği geri alınabilir şekilde kaydeden Windows 11 temizliği. |
-| [`ubuntu-server-debloat`](https://github.com/cemal-demirci/ubuntu-server-debloat) | snap, telemetri ve gereksiz servisleri kaldırır. Kritik bir paketi etkileyecekse hiçbir şey yapmadan durur. |
-| [`ffmpeg-broadcast`](https://github.com/cemal-demirci/ffmpeg-broadcast) | Yayıncılık için sade FFmpeg build'i ve 19 hazır yayın preseti: XDCAM, AVC-Intra, IMX, ProRes, DNxHD, DVB, HLS, SRT. |
+Her değişiklikte GitHub Actions, `k3s-minimal-install.sh` ile gerçek bir k3s node'u kurar. Traefik ve ServiceLB'nin gelmediğini, secret şifrelemenin açık olduğunu, `kubectl top`'un çalıştığını kontrol eder. Ardından gerçek iş yükleri oluşturup temizlik scriptini dry-run, `--apply` ve tekrar çalıştırma ile dener, en sonda k3s'i kaldırır.
 
 ## Lisans
 
-[MIT](LICENSE)
+[MIT](LICENSE). Kendi sorumluluğunuzda kullanın, önce test ortamında deneyin.
 
 ---
 

@@ -20,4 +20,4 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Install, fixtures, dry run, apply, uninstall
-        run: sudo bash tests/e2e.sh
+        run: sudo --preserve-env=GITHUB_ACTIONS bash tests/e2e.sh
