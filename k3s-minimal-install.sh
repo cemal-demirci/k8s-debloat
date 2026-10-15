@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Minimal k3s install  |  https://cemal.cloud  |  MIT
+#  Minimal k3s install  |  https://cemal.cloud  |  GPL-3.0-or-later
 #  Source: https://github.com/cemal-demirci/k8s-debloat
 #
 #  A lean k3s node: only what a cluster needs to run your workloads.

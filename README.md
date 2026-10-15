@@ -1,6 +1,6 @@
 # Kubernetes Debloat · Cemal.cloud
 
-[![Lisans: MIT](https://img.shields.io/badge/lisans-MIT-blue)](LICENSE)
+[![Lisans: GPL-3.0](https://img.shields.io/badge/lisans-GPL--3.0-blue)](LICENSE)
 [![Denetim](https://github.com/cemal-demirci/k8s-debloat/actions/workflows/ci.yml/badge.svg)](https://github.com/cemal-demirci/k8s-debloat/actions)
 ![k3s](https://img.shields.io/badge/k3s-stable-FFC61C)
 
@@ -143,7 +143,9 @@ testin dışında.
 
 ## Lisans
 
-[MIT](LICENSE). Kendi sorumluluğunuzda kullanın, önce test ortamında deneyin.
+[GPL-3.0](LICENSE). Kullanabilir, değiştirebilir ve paylaşabilirsiniz. Değiştirilmiş halini dağıtan herkes, kaynak kodunu da aynı lisansla açık paylaşmak zorundadır. Kendi sorumluluğunuzda kullanın, önce test ortamında deneyin.
+
+Copyright (C) 2026 Cemal Demirci (Cemal.cloud)
 
 ---
 
@@ -166,4 +168,4 @@ Two small tools for leaner Kubernetes:
 - **Tested:** every commit installs a real k3s node with the script, creates workloads and checks the cleanup dry run,
   apply and repeat run, the waste report and the plugin (49/49; kube-system runs only CoreDNS, local-path and
   metrics-server). HA and agent modes are not covered by CI.
-- **License:** MIT.
+- **License:** GPL-3.0-or-later.

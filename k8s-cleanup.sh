@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Kubernetes cluster cleanup  |  https://cemal.cloud  |  MIT
+#  Kubernetes cluster cleanup  |  https://cemal.cloud  |  GPL-3.0-or-later
 #  Source: https://github.com/cemal-demirci/k8s-debloat
 #
 #  Works on any cluster (k3s, kubeadm, EKS, AKS, GKE...). DRY RUN by default:
