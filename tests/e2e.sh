@@ -20,6 +20,9 @@ group() { echo "::group::$*"; }
 endgroup() { echo "::endgroup::"; }
 
 [[ $EUID -eq 0 ]] || { echo "run as root"; exit 1; }
+# CI logs are not always reachable: say where an unexpected failure happened.
+stopped() { local rc=$?; [[ -n "${GITHUB_ACTIONS:-}" ]] && echo "::error title=e2e stopped::line $1 (exit $rc): $2"; return 0; }
+trap 'stopped "$LINENO" "$BASH_COMMAND"' ERR
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 k() { k3s kubectl "$@"; }
 IMG=registry.k8s.io/e2e-test-images/busybox:1.36.1-1
@@ -31,6 +34,8 @@ endgroup
 check "config.yaml is 0600" test "$(stat -c %a /etc/rancher/k3s/config.yaml)" = 600
 check "kubeconfig is 0600" test "$(stat -c %a /etc/rancher/k3s/k3s.yaml)" = 600
 check "node is Ready" bash -c "k3s kubectl get nodes --no-headers | grep -q ' Ready'"
+# k3s creates the add-on Deployments shortly after the node is Ready; "kubectl wait" fails at once if they do not exist yet.
+for _ in $(seq 1 60); do k -n kube-system get deploy coredns metrics-server local-path-provisioner >/dev/null 2>&1 && break; sleep 3; done
 check "coredns, metrics-server, local-path available" \
   k3s kubectl -n kube-system wait --for=condition=Available deploy/coredns deploy/metrics-server deploy/local-path-provisioner --timeout=300s
 check "traefik not installed" bash -c "! k3s kubectl -n kube-system get deploy traefik"
