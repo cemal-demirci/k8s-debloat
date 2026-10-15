@@ -19,11 +19,16 @@
 #    PVCs not mounted by any pod, ConfigMaps/Secrets not referenced by any
 #    pod, empty namespaces, Helm release history beyond --keep-rs revisions
 #
+#  --waste: CPU / memory that pods reserve (requests) but do not use, per
+#    workload, from metrics-server. Read-only.
+#
 #  Usage:
 #    ./k8s-cleanup.sh                       # dry run on current context
 #    ./k8s-cleanup.sh --apply               # do it
 #    ./k8s-cleanup.sh -n media --apply      # one namespace
 #    ./k8s-cleanup.sh --context prod --older-than 72h
+#    ./k8s-cleanup.sh --waste               # reserved but idle CPU / memory
+#    ./k8s-cleanup.sh --install-plugin      # then: kubectl debloat --waste
 #
 #  Options:
 #    --apply                 actually delete (default: dry run)
@@ -35,6 +40,9 @@
 #                            reclaimPolicy Retain is NOT deleted)
 #    --prune-images          run "crictl rmi --prune" on this node
 #    --skip-reports          skip the report-only checks (faster on big clusters)
+#    --waste                 only the requests-vs-usage report, nothing deleted
+#    --top N                 workloads to list in --waste (default: 10)
+#    --install-plugin        install this script as "kubectl debloat"
 #    -h, --help              show this help
 #
 #  Requires: kubectl, jq
@@ -42,7 +50,7 @@
 set -Eeuo pipefail
 
 APPLY=0; NS=""; CONTEXT=""; OLDER="24h"; KEEP_RS=2
-DEL_PV=0; PRUNE_IMAGES=0; SKIP_REPORTS=0
+DEL_PV=0; PRUNE_IMAGES=0; SKIP_REPORTS=0; WASTE=0; TOP=10; INSTALL_PLUGIN=0
 KUBECTL="${KUBECTL:-kubectl}"
 
 c_b='\033[1;34m'; c_g='\033[1;32m'; c_y='\033[1;33m'; c_r='\033[1;31m'; c_d='\033[2m'; c_0='\033[0m'
@@ -64,17 +72,36 @@ while [[ $# -gt 0 ]]; do
     --delete-released-pv) DEL_PV=1 ;;
     --prune-images)       PRUNE_IMAGES=1 ;;
     --skip-reports)       SKIP_REPORTS=1 ;;
+    --waste)              WASTE=1 ;;
+    --top)                TOP="${2:?}"; shift ;;
+    --install-plugin)     INSTALL_PLUGIN=1 ;;
     -h|--help)            usage ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
   shift
 done
 
+if [[ $INSTALL_PLUGIN -eq 1 ]]; then
+  src="$(readlink -f "$0" 2>/dev/null || true)"
+  [[ -f "$src" ]] || die "run the downloaded file to install it (not through a pipe)"
+  if [[ $EUID -eq 0 ]]; then dir=/usr/local/bin; else dir="$HOME/.local/bin"; fi
+  mkdir -p "$dir"
+  install -m 0755 "$src" "$dir/kubectl-debloat"
+  ok "installed $dir/kubectl-debloat"
+  case ":$PATH:" in *":$dir:"*) ;; *) warn "$dir is not in your PATH, add it so kubectl can find the plugin" ;; esac
+  command -v jq >/dev/null || warn "jq is not installed; the plugin needs it"
+  info "use: kubectl debloat          (dry run)"
+  info "     kubectl debloat --waste  (reserved but idle CPU / memory)"
+  info "remove: rm $dir/kubectl-debloat"
+  exit 0
+fi
+
 command -v jq >/dev/null || die "jq is required"
 if ! command -v "$KUBECTL" >/dev/null; then
   command -v k3s >/dev/null && KUBECTL="k3s kubectl" || die "kubectl not found"
 fi
 [[ "$KEEP_RS" =~ ^[0-9]+$ ]] || die "--keep-rs must be a number"
+[[ "$TOP" =~ ^[0-9]+$ ]] || die "--top must be a number"
 
 to_seconds() {
   local v="$1"
@@ -93,8 +120,9 @@ k() {
 scope() { if [[ -n "$NS" ]]; then echo "-n $NS"; else echo "-A"; fi; }
 
 CTX_NAME="${CONTEXT:-$(k config current-context 2>/dev/null || echo default)}"
+MODE="MODE=dry-run"; [[ $APPLY -eq 1 ]] && MODE="MODE=APPLY"; [[ $WASTE -eq 1 ]] && MODE="MODE=waste report (read-only)"
 printf "${c_b}Cemal.cloud${c_0} | k8s cleanup  context=%s  scope=%s  %s\n" \
-  "$CTX_NAME" "${NS:-all namespaces}" "$([[ $APPLY -eq 1 ]] && echo 'MODE=APPLY' || echo 'MODE=dry-run')"
+  "$CTX_NAME" "${NS:-all namespaces}" "$MODE"
 k version --request-timeout=10s >/dev/null 2>&1 || k get --raw /version --request-timeout=10s >/dev/null || die "cannot reach the cluster"
 
 declare -A COUNT=( [pods]=0 [jobs]=0 [rs]=0 [pv]=0 )
@@ -121,6 +149,101 @@ delete_items() {
 # Fetch once, reuse.
 # shellcheck disable=SC2046
 PODS_JSON="$(k get pods $(scope) -o json)"
+
+# ----------------------------------------------------------------------------
+# --waste: requests vs real usage
+# ----------------------------------------------------------------------------
+# Kubernetes quantities -> millicores / bytes
+JQ_QTY='
+def cpu_m: if . == null then 0 else tostring as $s
+  | if   ($s | endswith("n")) then ($s[:-1] | tonumber) / 1000000
+    elif ($s | endswith("u")) then ($s[:-1] | tonumber) / 1000
+    elif ($s | endswith("m")) then ($s[:-1] | tonumber)
+    else ($s | tonumber) * 1000 end end;
+def mem_b: if . == null then 0 else (tostring | capture("^(?<n>[0-9.]+)(?<u>[A-Za-z]*)$")) as $c
+  | ($c.n | tonumber) * ({"": 1, "k": 1e3, "K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12,
+       "Ki": 1024, "Mi": 1048576, "Gi": 1073741824, "Ti": 1099511627776, "m": 0.001}[$c.u] // 1) end;'
+
+waste_report() {
+  local path="/apis/metrics.k8s.io/v1beta1/pods" metrics nodes rows
+  [[ -n "$NS" ]] && path="/apis/metrics.k8s.io/v1beta1/namespaces/$NS/pods"
+  metrics="$(k get --raw "$path" 2>/dev/null)" \
+    || die "metrics-server is not answering (kubectl top pod fails). Install it, or wait a minute after a fresh start."
+  nodes="$(k get nodes -o json)"
+
+  # one TSV row per workload: ns  workload  pods  req_cpu_m  used_cpu_m  req_mem_b  used_mem_b  measured_pods
+  rows="$(jq -r --argjson m "$metrics" "$JQ_QTY"'
+    def owner: . as $p
+      | ([.metadata.ownerReferences[]? | select(.controller == true)] | first) as $o
+      | ($p.metadata.labels["pod-template-hash"] // "") as $h
+      | if $o == null or $o.kind == "Node" then "pod/\($p.metadata.name)"
+        elif $o.kind == "ReplicaSet" and $h != "" then "deploy/\($o.name | rtrimstr("-" + $h))"
+        else "\({"StatefulSet": "sts", "DaemonSet": "ds", "ReplicaSet": "rs", "Job": "job"}[$o.kind] // ($o.kind | ascii_downcase))/\($o.name)" end;
+    ($m.items | map({key: "\(.metadata.namespace)/\(.metadata.name)",
+                     value: {cpu: ([.containers[].usage.cpu | cpu_m] | add // 0),
+                             mem: ([.containers[].usage.memory | mem_b] | add // 0)}}) | from_entries) as $use
+    | [.items[] | select(.status.phase == "Running")
+       | "\(.metadata.namespace)/\(.metadata.name)" as $id
+       | {ns: .metadata.namespace, wl: owner,
+          rc: ([.spec.containers[].resources.requests.cpu | cpu_m] | add // 0),
+          rm: ([.spec.containers[].resources.requests.memory | mem_b] | add // 0),
+          u: $use[$id]}]
+    | group_by([.ns, .wl])[]
+    | [.[0].ns, .[0].wl, length,
+       (map(.rc) | add), (map(.u.cpu // 0) | add),
+       (map(.rm) | add), (map(.u.mem // 0) | add),
+       (map(select(.u != null)) | length)]
+    | @tsv' <<<"$PODS_JSON")"
+
+  step "Reserved but idle: requests vs real use"
+  if [[ -z "$rows" ]]; then info "no running pods"; return; fi
+
+  local alloc
+  alloc="$(jq -r "$JQ_QTY"' [.items[].status.allocatable] | "\(map(.cpu | cpu_m) | add)\t\(map(.memory | mem_b) | add)\t\(length)"' <<<"$nodes")"
+
+  awk -F'\t' -v top="$TOP" -v alloc="$alloc" '
+    function fc(m) { return (m >= 1000) ? sprintf("%.1f", m / 1000) : sprintf("%dm", m + 0.5) }
+    function fm(b) { return (b >= 1073741824) ? sprintf("%.1fGi", b / 1073741824) : sprintf("%dMi", b / 1048576 + 0.5) }
+    function pct(a, b) { return (b > 0) ? sprintf("%d%%", 100 * a / b + 0.5) : "-" }
+    {
+      ic = $4 - $5; if (ic < 0 || $8 == 0) ic = 0
+      im = $6 - $7; if (im < 0 || $8 == 0) im = 0
+      if ($4 > 0 || $6 > 0) {
+        n++; name[n] = $1 "/" $2; pods[n] = $3
+        rc[n] = $4; uc[n] = $5; rm[n] = $6; um[n] = $7; idc[n] = ic; idm[n] = im; meas[n] = $8
+        RC += $4; RM += $6
+        if ($8 > 0) { UC += $5; UM += $7; MRC += $4; MRM += $6 }
+        IC += ic; IM += im
+      } else { nr++; nrpods += $3; if (nr <= 5) nrl = nrl (nrl == "" ? "" : ", ") $1 "/" $2 }
+    }
+    END {
+      # sort by idle CPU, then idle memory
+      for (i = 1; i <= n; i++) order[i] = i
+      for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++) {
+        a = order[i]; b = order[j]
+        if (idc[b] > idc[a] || (idc[b] == idc[a] && idm[b] > idm[a])) { order[i] = b; order[j] = a }
+      }
+      printf "    %-40s %4s  %8s %7s %7s  %8s %7s %7s\n", "WORKLOAD", "PODS", "CPU req", "used", "idle", "MEM req", "used", "idle"
+      for (k = 1; k <= n && k <= top; k++) {
+        i = order[k]; w = name[i]; if (length(w) > 40) w = substr(w, 1, 37) "..."
+        if (meas[i] == 0) { printf "    %-40s %4d  %8s %7s %7s  %8s %7s %7s\n", w, pods[i], fc(rc[i]), "?", "?", fm(rm[i]), "?", "?"; continue }
+        printf "    %-40s %4d  %8s %7s %7s  %8s %7s %7s\n", w, pods[i], fc(rc[i]), fc(uc[i]), fc(idc[i]), fm(rm[i]), fm(um[i]), fm(idm[i])
+      }
+      if (n > top) printf "    ... %d more (use --top)\n", n - top
+      split(alloc, A, "\t")
+      print ""
+      printf "    requested     : CPU %s of %s allocatable (%s), memory %s of %s (%s) on %d node(s)\n", fc(RC), fc(A[1]), pct(RC, A[1]), fm(RM), fm(A[2]), pct(RM, A[2]), A[3]
+      printf "    actually used : CPU %s (%s of requested), memory %s (%s of requested)\n", fc(UC), pct(UC, MRC), fm(UM), pct(UM, MRM)
+      printf "    idle reserved : CPU %s, memory %s  (held for these pods, unavailable to others)\n", fc(IC), fm(IM)
+      if (nr > 0) printf "    no requests   : %d workload(s), %d pod(s): %s%s  (the scheduler cannot plan for them)\n", nr, nrpods, nrl, (nr > 5 ? ", ..." : "")
+    }' <<<"$rows"
+  info "one metrics snapshot: check a busy period (kubectl top pod) before lowering requests"
+}
+
+if [[ $WASTE -eq 1 ]]; then
+  waste_report
+  exit 0
+fi
 
 # ----------------------------------------------------------------------------
 # 1. Finished pods
@@ -249,11 +372,13 @@ if [[ $SKIP_REPORTS -eq 0 ]]; then
   # shellcheck disable=SC2046
   helm_old="$(k get secrets $(scope) -l owner=helm -o json | jq -r --argjson keep "$KEEP_RS" '
     [.items[] | {ns: .metadata.namespace, rel: .metadata.labels.name,
-                 ver: ((.metadata.labels.version // "0") | tonumber)}]
+                 ver: ((.metadata.labels.version // "0") | tonumber),
+                 size: ((.data.release // "") | length * 3 / 4)}]
     | group_by([.ns, .rel])[]
     | sort_by(.ver) | reverse
     | select(length > $keep)
-    | "\(.[0].ns)/\(.[0].rel): \(length) revisions stored (helm upgrade --history-max \($keep))"')"
+    | (.[$keep:] | map(.size) | add) as $old
+    | "\(.[0].ns)/\(.[0].rel): \(length) revisions stored, \(if $old >= 1048576 then "\($old / 1048576 * 10 | floor / 10) MiB" else "\($old / 1024 | ceil) KiB" end) in old ones (helm upgrade --history-max \($keep))"')"
   if [[ -n "$helm_old" ]]; then while IFS= read -r l; do rep "$l"; done <<<"$helm_old"; else info "none"; fi
 fi
 
@@ -285,4 +410,5 @@ step "Summary ($([[ $APPLY -eq 1 ]] && echo deleted || echo 'would delete'))"
 printf "    pods %s  |  jobs %s  |  replicasets %s  |  pv %s\n" \
   "${COUNT[pods]}" "${COUNT[jobs]}" "${COUNT[rs]}" "${COUNT[pv]}"
 [[ $APPLY -eq 0 ]] && info "dry run: re-run with --apply to delete"
+info "reserved but idle CPU / memory: --waste"
 exit 0

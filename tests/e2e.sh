@@ -4,7 +4,9 @@
 #   1. k3s-minimal-install.sh installs a real k3s node with the minimal config
 #   2. k8s-cleanup.sh finds exactly the right objects in dry-run, deletes them
 #      with --apply, and finds nothing on the next run
-#   3. k3s uninstalls cleanly
+#   3. --waste finds a deployment that reserves 500m / 256Mi and uses ~0
+#   4. --install-plugin makes it work as "kubectl debloat"
+#   5. k3s uninstalls cleanly (after --apply and a repeat run)
 #
 # Do not run this on a machine you care about.
 set -Eeuo pipefail
@@ -82,6 +84,8 @@ k -n e2e create job job-old --image=$IMG -- true
 k -n e2e create cronjob nightly --image=$IMG --schedule="0 3 * * *" -- true
 k -n e2e create job cron-old --from=cronjob/nightly
 k -n e2e create deployment web --image=registry.k8s.io/pause:3.9 --replicas=0
+k -n e2e create deployment hog --image=registry.k8s.io/pause:3.9
+k -n e2e set resources deployment/hog --requests=cpu=500m,memory=256Mi
 for t in 3.8 3.7 3.6; do
   k -n e2e set image deployment/web pause=registry.k8s.io/pause:$t
   k -n e2e rollout status deployment/web --timeout=60s
@@ -94,6 +98,7 @@ k -n e2e wait --for=jsonpath='{.status.phase}'=Succeeded pod/completed --timeout
 k -n e2e wait --for=jsonpath='{.status.phase}'=Failed pod/failed --timeout=300s
 k -n e2e wait --for=condition=complete job/job-old job/cron-old --timeout=300s
 k -n e2e wait --for=condition=Ready pod/app --timeout=300s
+k -n e2e rollout status deployment/hog --timeout=300s
 for _ in $(seq 1 30); do
   [[ "$(k get pv e2e-pv-released -o jsonpath='{.status.phase}')" == Released ]] && break; sleep 2
 done
@@ -127,7 +132,34 @@ ALL="$(./k8s-cleanup.sh 2>&1)"
 check "report: empty namespace (all-namespace run)" grep -qF "namespace empty-ns" <<<"$ALL"
 check "dry run deleted nothing" k -n e2e get pod completed
 
-# ---------------------------------------------------------------- 4. apply
+# ---------------------------------------------------------------- 4. waste report
+echo "waiting for metrics of the hog pod"
+for _ in $(seq 1 36); do k -n e2e top pod -l app=hog --no-headers 2>/dev/null | grep -q hog && break; sleep 5; done
+group "k8s-cleanup.sh --waste"
+WASTE="$(./k8s-cleanup.sh --waste 2>&1)"; echo "$WASTE"
+endgroup
+FIRST="$(grep -A1 'WORKLOAD' <<<"$WASTE" | tail -n1)"
+check "waste: hog deployment is the top idle reservation" grep -q 'e2e/deploy/hog .* 500m' <<<"$FIRST"
+check "waste: hog was measured (not ?)" bash -c '! grep -q "?" <<<"$1"' _ "$FIRST"
+check "waste: totals printed" grep -q 'idle reserved : CPU' <<<"$WASTE"
+check "waste: pod without requests listed" grep -q 'no requests .*e2e/pod/app' <<<"$WASTE"
+check "waste: system workloads included (all namespaces)" grep -q 'kube-system/deploy/coredns' <<<"$WASTE"
+WNS="$(./k8s-cleanup.sh --waste -n e2e 2>&1)"
+check "waste -n e2e: other namespaces left out" bash -c '! grep -q kube-system <<<"$1"' _ "$WNS"
+check "waste deleted nothing" k -n e2e get pod completed
+IDLE_LINE="$(grep 'idle reserved' <<<"$WASTE" | sed 's/^ *//')"
+REQ_LINE="$(grep 'requested     :' <<<"$WASTE" | sed 's/^ *//')"
+
+# ---------------------------------------------------------------- 5. kubectl plugin
+./k8s-cleanup.sh --install-plugin
+check "plugin installed" test -x /usr/local/bin/kubectl-debloat
+KC=kubectl; command -v kubectl >/dev/null || KC="k3s kubectl"
+check "kubectl sees the plugin" bash -c "$KC plugin list 2>/dev/null | grep -q kubectl-debloat"
+PLUG="$($KC debloat -n e2e --older-than 60s 2>&1 || true)"
+check "kubectl debloat runs the cleanup" grep -qF "would delete pod e2e/completed" <<<"$PLUG"
+check "kubectl debloat --waste" bash -c "$KC debloat --waste -n e2e 2>&1 | grep -q 'e2e/deploy/hog'"
+
+# ---------------------------------------------------------------- 6. apply
 group "k8s-cleanup.sh --apply"
 ./k8s-cleanup.sh -n e2e --older-than 60s --delete-released-pv --skip-reports --apply
 endgroup
@@ -141,20 +173,22 @@ check "CronJob-owned Job kept"    k -n e2e get job cron-old
 check "2 ReplicaSets left"        test "$(k -n e2e get rs --no-headers | grep -c '^web-')" = 2
 check "Released PV deleted"       bash -c "! k3s kubectl get pv e2e-pv-released"
 check "unused ConfigMap NOT deleted (report only)" k -n e2e get configmap old-cfg
+check "hog deployment untouched by --apply" k -n e2e get deployment hog
 
 AGAIN="$(./k8s-cleanup.sh -n e2e --older-than 1h --skip-reports 2>&1)"
 check "second run finds nothing" grep -q "pods 0  |  jobs 0  |  replicasets 0  |  pv 0" <<<"$AGAIN"
 check "--prune-images on the node" ./k8s-cleanup.sh -n e2e --skip-reports --prune-images --apply
 
-# ---------------------------------------------------------------- 5. uninstall
+# ---------------------------------------------------------------- 7. uninstall
 group "uninstall"
 /usr/local/bin/k3s-uninstall.sh
 endgroup
 check "k3s removed" test ! -e /usr/local/bin/k3s
+rm -f /usr/local/bin/kubectl-debloat
 
 echo
 if [[ $FAILS -gt 0 ]]; then echo "$FAILS check(s) failed, $PASSES passed"; exit 1; fi
 echo "All end-to-end checks passed"
 if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
-  echo "::notice title=k3s + cleanup end-to-end::$PASSES checks passed on k3s $K3S_VERSION. kube-system ran only: $SYS_PODS. Cleanup dry run, --apply and repeat run verified against real workloads."
+  echo "::notice title=k3s + cleanup end-to-end::$PASSES checks passed on k3s $K3S_VERSION. kube-system ran only: $SYS_PODS. Cleanup dry run, --apply and repeat run verified against real workloads. Waste report: $REQ_LINE / $IDLE_LINE. kubectl debloat plugin works."
 fi
