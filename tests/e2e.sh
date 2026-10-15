@@ -191,4 +191,7 @@ if [[ $FAILS -gt 0 ]]; then echo "$FAILS check(s) failed, $PASSES passed"; exit 
 echo "All end-to-end checks passed"
 if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
   echo "::notice title=k3s + cleanup end-to-end::$PASSES checks passed on k3s $K3S_VERSION. kube-system ran only: $SYS_PODS. Cleanup dry run, --apply and repeat run verified against real workloads. Waste report: $REQ_LINE / $IDLE_LINE. kubectl debloat plugin works."
+  # the report itself, one notice line per row (header, top rows, totals)
+  WREP="$(sed 's/\x1b\[[0-9;]*m//g' <<<"$WASTE" | awk '/WORKLOAD/ {on = 1} on && NF {sub(/^    /, ""); print}' | head -n 12 | sed 's/%/%25/g' | paste -sd '|')"
+  echo "::notice title=Waste report::$WREP"
 fi
