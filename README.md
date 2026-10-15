@@ -1,6 +1,6 @@
 # Kubernetes Debloat · Cemal.cloud
 
-[![Lisans: GPL-3.0](https://img.shields.io/badge/lisans-GPL--3.0-blue)](LICENSE)
+[![Lisans: PolyForm Noncommercial](https://img.shields.io/badge/lisans-ticari%20olmayan%20kullan%C4%B1m%20%C3%BCcretsiz-orange)](LICENSE)
 [![Denetim](https://github.com/cemal-demirci/k8s-debloat/actions/workflows/ci.yml/badge.svg)](https://github.com/cemal-demirci/k8s-debloat/actions)
 ![k3s](https://img.shields.io/badge/k3s-stable-FFC61C)
 
@@ -143,7 +143,11 @@ testin dışında.
 
 ## Lisans
 
-[GPL-3.0](LICENSE). Kullanabilir, değiştirebilir ve paylaşabilirsiniz. Değiştirilmiş halini dağıtan herkes, kaynak kodunu da aynı lisansla açık paylaşmak zorundadır. Kendi sorumluluğunuzda kullanın, önce test ortamında deneyin.
+[PolyForm Noncommercial 1.0.0](LICENSE). Kişisel kullanım, eğitim, araştırma, kâr amacı gütmeyen kuruluşlar ve kamu kurumları için **ücretsizdir**.
+
+**Ticari kullanım** için ticari lisans gerekir: bir şirketin kendi bilgisayarlarında kullanması, müşterilere hizmet olarak sunulması, bir ürüne eklenmesi ya da satılması. İletişim: [cemaldemirci0034@gmail.com](mailto:cemaldemirci0034@gmail.com)
+
+Kendi sorumluluğunuzda kullanın.
 
 Copyright (C) 2026 Cemal Demirci (Cemal.cloud)
 
@@ -168,4 +172,4 @@ Two small tools for leaner Kubernetes:
 - **Tested:** every commit installs a real k3s node with the script, creates workloads and checks the cleanup dry run,
   apply and repeat run, the waste report and the plugin (49/49; kube-system runs only CoreDNS, local-path and
   metrics-server). HA and agent modes are not covered by CI.
-- **License:** GPL-3.0-or-later.
+- **License:** PolyForm Noncommercial 1.0.0. Free for personal, educational, nonprofit and government use; commercial use (including inside a company) needs a commercial license: cemaldemirci0034@gmail.com.
